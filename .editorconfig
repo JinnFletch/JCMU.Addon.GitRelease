@@ -1,0 +1,17 @@
+﻿# This is the root of the project
+root = true
+
+# Rules for all C# files
+[*.cs]
+
+# Default severity for analyzer diagnostics with category 'Style'
+dotnet_analyzer_diagnostic.category-Style.severity = silent
+
+# CA2007: Do not await a task without calling ConfigureAwait
+# Severity: error
+#
+# WHY: As a library, this code must not assume a specific SynchronizationContext.
+# By using ConfigureAwait(false), the continuation after the await can run on any
+# thread pool thread, preventing deadlocks in UI or classic ASP.NET applications
+# that have a single-threaded context. This is non-negotiable for robust library code.
+dotnet_diagnostic.CA2007.severity = error

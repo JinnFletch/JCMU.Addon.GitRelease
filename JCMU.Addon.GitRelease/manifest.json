@@ -1,0 +1,14 @@
+{
+  "AddonId": "JCMU.Addon.GitRelease",
+  "DisplayName": "Create GitHub Release",
+  "Version": "1.0.0",
+  "Author": "JinnFletch",
+  "MinCoreVersion": "1.3.1",
+  "Menu": {
+    "MenuItemName": "Create GitHub Release...",
+    "Ordinal": 10,
+    "Category": "Git Tools",
+    "RunInBackground": false,
+    "SubItems": null
+  }
+}

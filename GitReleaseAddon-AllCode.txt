@@ -1,0 +1,575 @@
+
+
+ *****************
+JCMU.Addon.GitRelease.slnx
+ *****************
+
+
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="readme.md" />
+  </Folder>
+  <Project Path="JCMU.Addon.GitRelease/JCMU.Addon.GitRelease.csproj" />
+</Solution>
+
+
+ *****************
+JCMU.Addon.GitRelease/JCMU.Addon.GitRelease.csproj
+ *****************
+
+
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<LangVersion>12</LangVersion>
+		<Version>1.0.2</Version>
+		<RootNamespace>JinnDev.$(MSBuildProjectName.Replace(" ", "_"))</RootNamespace>
+		<AssemblyName>JinnDev.$(MSBuildProjectName.Replace(" ", "_"))</AssemblyName>
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<Authors>JinnDev</Authors>
+		<Company>Jinn Studios</Company>
+		<Product>Simple Git Addon to create a Release based on the CSProj Version</Product>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="JinnDev.JCMU.SDK" Version="1.1.2" />
+		<PackageReference Include="JinnDev.Utilities.CommandLine" Version="8.0.4" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Update="manifest.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+</Project>
+
+ *****************
+JCMU.Addon.GitRelease/GitReleaseAddon.cs
+ *****************
+
+
+using JinnDev.JCMU.Addon.GitRelease.Models;
+using JinnDev.JCMU.Addon.GitRelease.Services;
+using JinnDev.JCMU.SDK.Interfaces;
+using JinnDev.JCMU.SDK.Models;
+using JinnDev.Utilities.CommandLine;
+using JinnDev.Utilities.Monad;
+
+namespace JinnDev.JCMU.Addon.GitRelease;
+
+public class GitReleaseAddon : IJcmuAddon
+{
+    public async Task<Maybe<int>> ExecuteAsync(ActionContext context)
+    {
+        var host = context.HostServices;
+        var runner = new StatelessRunner();
+
+        host.Logger.LogInfo("==================================================");
+        host.Logger.LogInfo("    JCMU GitHub Orchestrator: Release Mode        ");
+        host.Logger.LogInfo("==================================================\n");
+
+        return await ProjectDiscoveryService.LocateExecutableProjectAsync(context.TargetDirectory, host)
+            .MapAsync(path => new ReleaseContext { TargetDirectory = context.TargetDirectory, ProjectFilePath = path })
+            .BindAsync(ProjectDiscoveryService.ExtractMetadata)
+            .BindAsync(ctx => PromptUserOptionsAsync(ctx, host))
+            .BindAsync(ProjectMutationService.UpdateProjectVersion)
+            .BindAsync(ctx => GitCommitService.CommitVersionBumpAsync(ctx, runner, host))
+            .BindAsync(ctx => GitSyncService.DetermineGitHubRemoteAsync(ctx, runner))
+            .BindAsync(ctx => GitSyncService.EnsureRemoteSyncAsync(ctx, runner, host))
+            .BindAsync(ctx => GitHubOrchestratorService.VerifyNewTagAsync(ctx, runner, host))
+            .BindAsync(async ctx =>
+            {
+                // Nested bind allows us to keep 'ctx' in scope while capturing the optional binary path
+                return await GitHubOrchestratorService.ExecuteOptionalBuildAsync(ctx, runner, host)
+                    .BindAsync(binaryPath => GitHubOrchestratorService.CreateGitHubReleaseAsync(ctx, binaryPath, runner, host)).ConfigureAwait(false);
+            })
+            .MatchAsync(
+            some: () =>
+            {
+                host.Logger.LogInfo("\n[FINISH] GitHub Release process complete.");
+                return Maybe.Some<int>(5); // Success: Auto-close in 5s
+            },
+            none: err =>
+            {
+                host.Logger.LogError($"Release Failed: {err.Message}");
+                return Maybe.None<int>(err.Message); // Failure: Display error
+            })
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Handles the interactive configuration of the release.
+    /// </summary>
+    private static async Task<Maybe<ReleaseContext>> PromptUserOptionsAsync(ReleaseContext ctx, IHostServices host)
+    {
+        // 1. Version Override
+        var verResult = await host.PromptUserAsync($"Target Version [{ctx.InitialVersion}]:").ConfigureAwait(false);
+        var finalVersion = verResult.Match(
+            some: v => string.IsNullOrWhiteSpace(v) ? ctx.InitialVersion : v.Trim(),
+            none: _ => ctx.InitialVersion
+        );
+
+        // 2. Local Build Opt-In
+        var buildResult = await host.PromptUserAsync("Build and upload local .exe? (y/N):").ConfigureAwait(false);
+        var attachLocal = buildResult.Match(
+            some: b => b.Equals("y", StringComparison.OrdinalIgnoreCase),
+            none: _ => false
+        );
+
+        return Maybe.Some(ctx with
+        {
+            FinalVersion = finalVersion,
+            AttachLocalBinary = attachLocal
+        });
+    }
+}
+
+ *****************
+JCMU.Addon.GitRelease/Models/ReleaseContext.cs
+ *****************
+
+
+namespace JinnDev.JCMU.Addon.GitRelease.Models;
+
+public record ReleaseContext
+{
+    public required string TargetDirectory { get; init; }
+    public string ProjectFilePath { get; init; } = string.Empty;
+    public string Tfm { get; init; } = string.Empty;
+    public string InitialVersion { get; init; } = string.Empty;
+    public string FinalVersion { get; init; } = string.Empty;
+    public string Owner { get; init; } = string.Empty;
+    public string Repo { get; init; } = string.Empty;
+
+    // Flags for conditional orchestrator behavior
+    public bool AttachLocalBinary { get; init; } = false;
+    public bool IsVersionBumped => !InitialVersion.Equals(FinalVersion, StringComparison.OrdinalIgnoreCase);
+}
+
+ *****************
+JCMU.Addon.GitRelease/Services/GitCommitService.cs
+ *****************
+
+
+using JinnDev.JCMU.Addon.GitRelease.Models;
+using JinnDev.JCMU.SDK.Interfaces;
+using JinnDev.Utilities.CommandLine;
+using JinnDev.Utilities.Monad;
+
+namespace JinnDev.JCMU.Addon.GitRelease.Services;
+
+public static class GitCommitService
+{
+    /// <summary>
+    /// Adds and commits the project file if a version bump occurred.
+    /// </summary>
+    public static async Task<Maybe<ReleaseContext>> CommitVersionBumpAsync(
+        ReleaseContext ctx,
+        IStatelessRunner runner,
+        IHostServices host)
+    {
+        if (!ctx.IsVersionBumped) return Maybe.Some(ctx);
+
+        host.Logger.LogInfo($"[Git] Committing version bump to {ctx.FinalVersion}...");
+
+        var projectDir = Path.GetDirectoryName(ctx.ProjectFilePath)!;
+        var fileName = Path.GetFileName(ctx.ProjectFilePath);
+
+        // 1. Stage the file
+        var addRequest = CommandBuilder.Create("git")
+            .WithArgument("add")
+            .WithQuotedArgument(fileName)
+            .InDirectory(projectDir)
+            .Build();
+
+        // 2. Commit the file
+        var commitRequest = CommandBuilder.Create("git")
+            .WithArgument("commit")
+            .WithArgument("-m")
+            .WithQuotedArgument($"chore: bump version to {ctx.FinalVersion}")
+            .InDirectory(projectDir)
+            .Build();
+
+        return await runner.RunBufferedAsync(addRequest)
+            .EnsureSuccessAsync("Failed to stage .csproj change.")
+            .BindAsync(_ => runner.RunBufferedAsync(commitRequest))
+            .EnsureSuccessAsync("Failed to commit version bump.")
+            .MapAsync(_ => ctx)
+            .ConfigureAwait(false);
+    }
+}
+
+ *****************
+JCMU.Addon.GitRelease/Services/GitHubOrchestratorService.cs
+ *****************
+
+
+using JinnDev.JCMU.Addon.GitRelease.Models;
+using JinnDev.JCMU.SDK.Interfaces;
+using JinnDev.Utilities.CommandLine;
+using JinnDev.Utilities.Monad;
+using System.Xml.Linq;
+
+namespace JinnDev.JCMU.Addon.GitRelease.Services;
+
+public static class GitHubOrchestratorService
+{
+    /// <summary>
+    /// Checks GitHub to see if a release with this version tag already exists.
+    /// </summary>
+    public static async Task<Maybe<ReleaseContext>> VerifyNewTagAsync(ReleaseContext ctx, IStatelessRunner runner, IHostServices host)
+    {
+        var projectDir = Path.GetDirectoryName(ctx.ProjectFilePath)!;
+        var request = CommandBuilder.Create("gh").WithArgument($"release view v{ctx.FinalVersion}").InDirectory(projectDir).Build();
+
+        return await runner.RunBufferedAsync(request).BindAsync(res =>
+            res.ExitCode == 0
+                ? Maybe.None<ReleaseContext>($"Release 'v{ctx.FinalVersion}' already exists on GitHub.")
+                : Maybe.Some(ctx))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Executes a local publish ONLY if the user opted-in.
+    /// </summary>
+    public static async Task<Maybe<string?>> ExecuteOptionalBuildAsync(ReleaseContext ctx, IStatelessRunner runner, IHostServices host)
+    {
+        if (!ctx.AttachLocalBinary) return Maybe.SomeAllowNull<string?>(null);
+
+        return await Maybe.TryAsync<string?>(async () =>
+        {
+            host.Logger.LogInfo($"\n[Build] Compiling standalone executable (v{ctx.FinalVersion})...");
+
+            // Validate Single-File requirement for local uploads
+            var xml = XDocument.Load(ctx.ProjectFilePath);
+            var isSingle = xml.Descendants("PublishSingleFile").FirstOrDefault()?.Value?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false;
+            if (!isSingle) throw new Exception("Local attachment requires <PublishSingleFile>true</PublishSingleFile> in the .csproj.");
+
+            var projectDir = Path.GetDirectoryName(ctx.ProjectFilePath)!;
+            var buildReq = CommandBuilder.Create("dotnet")
+                .WithArgument("publish").WithQuotedArgument(ctx.ProjectFilePath)
+                .WithArgument("-c Release").WithArgument($"-p:Version={ctx.FinalVersion}")
+                .InDirectory(projectDir).Build();
+
+            await foreach (var line in runner.StreamAsync(buildReq).ConfigureAwait(false)) 
+                host.Logger.LogInfo($"  [dotnet] {line}");
+
+            var binaryPath = Path.Combine(projectDir, "bin", "Release", ctx.Tfm, "publish", $"{Path.GetFileNameWithoutExtension(ctx.ProjectFilePath)}.exe");
+            if (!File.Exists(binaryPath)) throw new Exception("Could not locate the compiled .exe file.");
+
+            host.Logger.LogInfo("[✓] Local build successful.");
+            return binaryPath;
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The final step: Creates the release and optionally attaches the binary.
+    /// </summary>
+    public static async Task<Maybe> CreateGitHubReleaseAsync(ReleaseContext ctx, string? binaryPath, IStatelessRunner runner, IHostServices host)
+    {
+        host.Logger.LogInfo($"\n[GitHub] Creating release v{ctx.FinalVersion}...");
+        var projectDir = Path.GetDirectoryName(ctx.ProjectFilePath)!;
+
+        var requestBuilder = CommandBuilder.Create("gh")
+            .WithArgument("release create").WithArgument($"v{ctx.FinalVersion}")
+            .WithArgument("--title").WithQuotedArgument($"v{ctx.FinalVersion}")
+            .WithArgument("--generate-notes");
+
+        if (!string.IsNullOrEmpty(binaryPath)) requestBuilder.WithQuotedArgument(binaryPath);
+
+        return await runner.RunBufferedAsync(requestBuilder.InDirectory(projectDir).Build())
+            .EnsureSuccessAsync(res => $"GitHub release failed: {res.StandardError}")
+            .TapAsync(res => host.Logger.LogInfo($"[✓] {res.StandardOutput.Trim()}"))
+            .BindAsync(_ => Maybe.SUCCESS)
+            .ConfigureAwait(false);
+    }
+}
+
+ *****************
+JCMU.Addon.GitRelease/Services/GitSyncService.cs
+ *****************
+
+
+using System.Text.RegularExpressions;
+using JinnDev.JCMU.Addon.GitRelease.Models;
+using JinnDev.JCMU.SDK.Interfaces;
+using JinnDev.Utilities.CommandLine;
+using JinnDev.Utilities.Monad;
+
+namespace JinnDev.JCMU.Addon.GitRelease.Services;
+
+public static class GitSyncService
+{
+    /// <summary>
+    /// Extracts the GitHub Owner and Repo name from the git remote URL.
+    /// </summary>
+    public static async Task<Maybe<ReleaseContext>> DetermineGitHubRemoteAsync(ReleaseContext ctx, IStatelessRunner runner)
+    {
+        var projectDir = Path.GetDirectoryName(ctx.ProjectFilePath)!;
+        var request = CommandBuilder.Create("git").WithArgument("remote get-url origin").InDirectory(projectDir).Build();
+
+        return await runner.RunBufferedAsync(request)
+            .EnsureSuccessAsync("Failed to read git remote.")
+            .BindAsync(res =>
+            {
+                var match = Regex.Match(res.StandardOutput.Trim(), @"github\.com[:/](.+?)/(.+?)(\.git)?$", RegexOptions.IgnoreCase);
+                return match.Success
+                    ? Maybe.Some(ctx with { Owner = match.Groups[1].Value, Repo = match.Groups[2].Value })
+                    : Maybe.None<ReleaseContext>("Could not parse GitHub Owner/Repo from remote URL.");
+            }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Forces a monadic sync loop until Local HEAD == Origin HEAD.
+    /// </summary>
+    public static async Task<Maybe<ReleaseContext>> EnsureRemoteSyncAsync(ReleaseContext ctx, IStatelessRunner runner, IHostServices host)
+    {
+        var projectDir = Path.GetDirectoryName(ctx.ProjectFilePath)!;
+        host.Logger.LogInfo("\n[Git] Synchronizing with GitHub...");
+
+        while (true)
+        {
+            // 1. Chain all the git data gathering monads together
+            var iterationState = await RunGitAsync("status --porcelain", projectDir, runner)
+                .BindAsync(status => string.IsNullOrWhiteSpace(status)
+                    ? RunGitAsync("fetch", projectDir, runner)
+                    : Task.FromResult(Maybe.None<string>("Repository has uncommitted changes. Please commit or stash them first.")))
+                .BindAsync(_ => RunGitAsync("rev-parse HEAD", projectDir, runner))
+                .BindAsync(local => RunGitAsync("rev-parse @{u}", projectDir, runner)
+                    .MapAsync(remote => (Local: local, Remote: remote)))
+                .BindAsync(pair => RunGitAsync("merge-base HEAD @{u}", projectDir, runner)
+                    .MapAsync(baseHash => (pair.Local, pair.Remote, BaseHash: baseHash)))
+                .ConfigureAwait(false);
+
+            // 2. Safely unwrap and evaluate the state
+            var evaluation = await iterationState.MatchAsync(
+                someAsync: async hashes =>
+                {
+                    if (hashes.Local == hashes.Remote)
+                    {
+                        host.Logger.LogInfo("[✓] Local is in-sync with GitHub.");
+                        return Maybe.Some(true); // Return True = Done Looping
+                    }
+
+                    if (hashes.Remote != hashes.BaseHash && hashes.Local == hashes.BaseHash)
+                        return Maybe.None<bool>("Your local branch is behind origin. Please 'git pull' before releasing.");
+
+                    host.Logger.LogWarning("You have commits that haven't been pushed to GitHub yet.");
+                    var inputResult = await host.PromptUserAsync("Push changes to GitHub now? (y/n):").ConfigureAwait(false);
+
+                    // 3. Match the user input
+                    return await inputResult.MatchAsync(
+                        someAsync: async val =>
+                        {
+                            if (val.Equals("y", StringComparison.OrdinalIgnoreCase))
+                            {
+                                host.Logger.LogInfo("[Git] Pushing to origin...");
+                                return await RunGitAsync("push", projectDir, runner).MapAsync(_ => false).ConfigureAwait(false); // Return False = Loop Again
+                            }
+                            return Maybe.None<bool>("Sync cancelled. Code must be pushed to GitHub to trigger a release.");
+                        },
+                        noneAsync: async err => Maybe.None<bool>("Sync cancelled.")
+                    ).ConfigureAwait(false);
+                },
+                noneAsync: async err => Maybe.None<bool>(err.Message)
+            ).ConfigureAwait(false);
+
+            // 4. Handle the evaluation result
+            if (!evaluation.HasValue) return Maybe.None<ReleaseContext>(evaluation.Message);
+
+            // We know it has a value at this point, but we still use Match for pure extraction
+            bool isSynced = evaluation.Match(some: val => val, none: _ => false);
+            if (isSynced) return Maybe.Some(ctx);
+        }
+    }
+
+    /// <summary>
+    /// Monadic helper to execute git commands and extract the output.
+    /// </summary>
+    private static Task<Maybe<string>> RunGitAsync(string args, string dir, IStatelessRunner runner)
+    {
+        var request = CommandBuilder.Create("git").WithArgument(args).InDirectory(dir).Build();
+
+        return runner.RunBufferedAsync(request)
+            .EnsureSuccessAsync($"Git command failed: git {args}")
+            .MapAsync(res => res.StandardOutput.Trim());
+    }
+}
+
+ *****************
+JCMU.Addon.GitRelease/Services/ProjectDiscoveryService.cs
+ *****************
+
+
+using JinnDev.JCMU.Addon.GitRelease.Models;
+using JinnDev.JCMU.SDK.Interfaces;
+using JinnDev.Utilities.Monad;
+using System.Xml.Linq;
+
+namespace JinnDev.JCMU.Addon.GitRelease.Services;
+
+public static class ProjectDiscoveryService
+{
+    private static readonly string[] IgnoreFolders = { ".git", ".vs", "Publish", "bin", "obj", ".github" };
+
+    public static async Task<Maybe<string>> LocateExecutableProjectAsync(string targetDir, IHostServices host)
+    {
+        return await Maybe.TryAsync(async () =>
+        {
+            var candidates = Directory.GetFiles(targetDir, "*.csproj", SearchOption.AllDirectories)
+                .Where(f => !f.Contains("bin") && !f.Contains("obj"))
+                .Where(f => {
+                    var xml = XDocument.Load(f);
+                    var type = xml.Descendants("OutputType").FirstOrDefault()?.Value;
+                    return type != null && type.Contains("Exe", StringComparison.OrdinalIgnoreCase);
+                }).ToList();
+
+            if (candidates.Count == 0) throw new Exception("No executable projects (<OutputType>Exe</OutputType>) found.");
+            if (candidates.Count == 1) return candidates[0];
+
+            host.Logger.LogInfo("\nMultiple projects found:");
+            for (int i = 0; i < candidates.Count; i++) host.Logger.LogInfo($"{i + 1}. {Path.GetFileName(candidates[i])}");
+
+            var result = await host.PromptUserAsync($"Select project (1-{candidates.Count}):").ConfigureAwait(false);
+            return result.Bind(input => int.TryParse(input, out int choice) && choice > 0 && choice <= candidates.Count
+                ? Maybe.Some(candidates[choice - 1])
+                : Maybe.None<string>("Invalid selection."));
+        }).ConfigureAwait(false);
+    }
+
+    public static Maybe<ReleaseContext> ExtractMetadata(ReleaseContext ctx)
+    {
+        return Maybe.Try<ReleaseContext>(() =>
+        {
+            var xml = XDocument.Load(ctx.ProjectFilePath);
+            var tfm = xml.Descendants("TargetFramework").FirstOrDefault()?.Value
+                      ?? xml.Descendants("TargetFrameworks").FirstOrDefault()?.Value?.Split(';').FirstOrDefault();
+            var ver = xml.Descendants("Version").FirstOrDefault()?.Value
+                      ?? xml.Descendants("PackageVersion").FirstOrDefault()?.Value ?? "1.0.0";
+
+            if (string.IsNullOrWhiteSpace(tfm)) throw new Exception("Could not determine TargetFramework.");
+
+            return ctx with { Tfm = tfm, InitialVersion = ver, FinalVersion = ver };
+        });
+    }
+
+    public static Maybe<ReleaseContext> ValidateAndExtractMetadata(ReleaseContext ctx)
+    {
+        return Maybe.Try<ReleaseContext>(() =>
+        {
+            var xml = XDocument.Load(ctx.ProjectFilePath);
+
+            // 1. Enforce PublishSingleFile
+            var singleFile = xml.Descendants("PublishSingleFile").FirstOrDefault()?.Value;
+            if (string.IsNullOrWhiteSpace(singleFile) || !singleFile.Equals("true", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception($"The project '{Path.GetFileName(ctx.ProjectFilePath)}' is missing <PublishSingleFile>true</PublishSingleFile>.\n" +
+                                    "GitHub releases require a standalone executable to prevent crashes on the user's machine.");
+            }
+
+            // 2. Extract Target Framework (TFM)
+            var tfm = xml.Descendants("TargetFramework").FirstOrDefault()?.Value
+                      ?? xml.Descendants("TargetFrameworks").FirstOrDefault()?.Value?.Split(';').FirstOrDefault();
+
+            if (string.IsNullOrWhiteSpace(tfm))
+                throw new Exception("Could not determine the <TargetFramework> from the project file.");
+
+            // 3. Extract Version
+            var version = xml.Descendants("Version").FirstOrDefault()?.Value
+                          ?? xml.Descendants("PackageVersion").FirstOrDefault()?.Value
+                          ?? xml.Descendants("AssemblyVersion").FirstOrDefault()?.Value
+                          ?? xml.Descendants("FileVersion").FirstOrDefault()?.Value;
+
+            if (string.IsNullOrWhiteSpace(version))
+                throw new Exception("Could not extract a version tag (<Version>, <AssemblyVersion>, etc.) from the project file.");
+
+            return ctx with
+            {
+                Tfm = tfm,
+                InitialVersion = version,
+                FinalVersion = version // Default final to initial until user overrides
+            };
+        });
+    }
+
+    private static async Task<string> PromptForProjectSelectionAsync(List<string> candidates, IHostServices host)
+    {
+        host.Logger.LogInfo("\nMultiple executable projects detected:");
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            host.Logger.LogInfo($"{i + 1}. {Path.GetFileName(candidates[i])}");
+        }
+
+        var result = await host.PromptUserAsync($"\nSelect project (1-{candidates.Count}):").ConfigureAwait(false);
+
+        return result.Match(
+            some: input =>
+            {
+                if (int.TryParse(input, out int choice) && choice > 0 && choice <= candidates.Count)
+                    return candidates[choice - 1];
+
+                throw new Exception("Invalid project selection.");
+            },
+            none: err => throw new Exception("Selection cancelled.")
+        );
+    }
+}
+
+
+ *****************
+JCMU.Addon.GitRelease/Services/ProjectMutationService.cs
+ *****************
+
+
+using JinnDev.JCMU.Addon.GitRelease.Models;
+using JinnDev.Utilities.Monad;
+using System.Xml.Linq;
+
+namespace JinnDev.JCMU.Addon.GitRelease.Services;
+
+public static class ProjectMutationService
+{
+    /// <summary>
+    /// Physically overwrites the version tags in the .csproj file.
+    /// </summary>
+    public static Maybe<ReleaseContext> UpdateProjectVersion(ReleaseContext ctx)
+    {
+        if (!ctx.IsVersionBumped) return Maybe.Some(ctx);
+
+        return Maybe.Try<ReleaseContext>(() =>
+        {
+            var xml = XDocument.Load(ctx.ProjectFilePath);
+
+            // We update all common versioning tags found in .NET projects
+            var versionTags = new[] { "Version", "PackageVersion", "AssemblyVersion", "FileVersion" };
+            bool updated = false;
+
+            foreach (var tagName in versionTags)
+            {
+                var element = xml.Descendants(tagName).FirstOrDefault();
+                if (element != null)
+                {
+                    element.Value = ctx.FinalVersion;
+                    updated = true;
+                }
+            }
+
+            // If no version tag existed at all, we create the <Version> tag in the first PropertyGroup
+            if (!updated)
+            {
+                var propertyGroup = xml.Descendants("PropertyGroup").FirstOrDefault();
+                if (propertyGroup != null)
+                {
+                    propertyGroup.Add(new XElement("Version", ctx.FinalVersion));
+                }
+            }
+
+            xml.Save(ctx.ProjectFilePath);
+            return ctx;
+        });
+    }
+}

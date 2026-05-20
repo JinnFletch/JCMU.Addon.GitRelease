@@ -9,39 +9,45 @@ public static class ProjectDiscoveryService
 {
     private static readonly string[] IgnoreFolders = { ".git", ".vs", "Publish", "bin", "obj", ".github" };
 
-    public static async Task<Maybe<string>> LocateExecutableProjectAsync(string targetDirectory, IHostServices host)
+    public static async Task<Maybe<string>> LocateExecutableProjectAsync(string targetDir, IHostServices host)
     {
-        return await Maybe.TryAsync<string>(async () =>
+        return await Maybe.TryAsync(async () =>
         {
-            var candidates = new List<string>();
-            var directories = new DirectoryInfo(targetDirectory).GetDirectories();
-            var allDirs = new List<DirectoryInfo> { new DirectoryInfo(targetDirectory) };
-            allDirs.AddRange(directories.Where(d => !IgnoreFolders.Any(f => d.Name.Equals(f, StringComparison.OrdinalIgnoreCase))));
+            var candidates = Directory.GetFiles(targetDir, "*.csproj", SearchOption.AllDirectories)
+                .Where(f => !f.Contains("bin") && !f.Contains("obj"))
+                .Where(f => {
+                    var xml = XDocument.Load(f);
+                    var type = xml.Descendants("OutputType").FirstOrDefault()?.Value;
+                    return type != null && type.Contains("Exe", StringComparison.OrdinalIgnoreCase);
+                }).ToList();
 
-            foreach (var dir in allDirs)
-            {
-                var csprojs = dir.GetFiles("*.csproj");
-                foreach (var proj in csprojs)
-                {
-                    var xml = XDocument.Load(proj.FullName);
-                    var outputType = xml.Descendants("OutputType").FirstOrDefault()?.Value;
+            if (candidates.Count == 0) throw new Exception("No executable projects (<OutputType>Exe</OutputType>) found.");
+            if (candidates.Count == 1) return candidates[0];
 
-                    if (outputType != null && (outputType.Equals("Exe", StringComparison.OrdinalIgnoreCase) ||
-                                               outputType.Equals("WinExe", StringComparison.OrdinalIgnoreCase)))
-                    {
-                        candidates.Add(proj.FullName);
-                    }
-                }
-            }
+            host.Logger.LogInfo("\nMultiple projects found:");
+            for (int i = 0; i < candidates.Count; i++) host.Logger.LogInfo($"{i + 1}. {Path.GetFileName(candidates[i])}");
 
-            if (candidates.Count == 0)
-                throw new Exception("No executable projects (<OutputType>Exe</OutputType>) found in the target directory.");
-
-            if (candidates.Count == 1)
-                return candidates[0];
-
-            return await PromptForProjectSelectionAsync(candidates, host).ConfigureAwait(false);
+            var result = await host.PromptUserAsync($"Select project (1-{candidates.Count}):").ConfigureAwait(false);
+            return result.Bind(input => int.TryParse(input, out int choice) && choice > 0 && choice <= candidates.Count
+                ? Maybe.Some(candidates[choice - 1])
+                : Maybe.None<string>("Invalid selection."));
         }).ConfigureAwait(false);
+    }
+
+    public static Maybe<ReleaseContext> ExtractMetadata(ReleaseContext ctx)
+    {
+        return Maybe.Try<ReleaseContext>(() =>
+        {
+            var xml = XDocument.Load(ctx.ProjectFilePath);
+            var tfm = xml.Descendants("TargetFramework").FirstOrDefault()?.Value
+                      ?? xml.Descendants("TargetFrameworks").FirstOrDefault()?.Value?.Split(';').FirstOrDefault();
+            var ver = xml.Descendants("Version").FirstOrDefault()?.Value
+                      ?? xml.Descendants("PackageVersion").FirstOrDefault()?.Value ?? "1.0.0";
+
+            if (string.IsNullOrWhiteSpace(tfm)) throw new Exception("Could not determine TargetFramework.");
+
+            return ctx with { Tfm = tfm, InitialVersion = ver, FinalVersion = ver };
+        });
     }
 
     public static Maybe<ReleaseContext> ValidateAndExtractMetadata(ReleaseContext ctx)

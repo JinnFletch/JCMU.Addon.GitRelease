@@ -9,4 +9,8 @@ public record ReleaseContext
     public string FinalVersion { get; init; } = string.Empty;
     public string Owner { get; init; } = string.Empty;
     public string Repo { get; init; } = string.Empty;
+
+    // Flags for conditional orchestrator behavior
+    public bool AttachLocalBinary { get; init; } = false;
+    public bool IsVersionBumped => !InitialVersion.Equals(FinalVersion, StringComparison.OrdinalIgnoreCase);
 }

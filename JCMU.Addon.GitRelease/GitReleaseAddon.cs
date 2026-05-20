@@ -12,59 +12,64 @@ public class GitReleaseAddon : IJcmuAddon
     public async Task<Maybe<int>> ExecuteAsync(ActionContext context)
     {
         var host = context.HostServices;
-
-        // IStatelessRunner is instantiated here so it can be passed down the pipeline
         var runner = new StatelessRunner();
 
         host.Logger.LogInfo("==================================================");
-        host.Logger.LogInfo("    GitHub Release Creator (Single-File Exe)      ");
+        host.Logger.LogInfo("    JCMU GitHub Orchestrator: Release Mode        ");
         host.Logger.LogInfo("==================================================\n");
 
-        // The Railway-Oriented Pipeline
-        var pipelineResult = await ProjectDiscoveryService.LocateExecutableProjectAsync(context.TargetDirectory, host)
-            .MapAsync(projectPath => new ReleaseContext
+        return await ProjectDiscoveryService.LocateExecutableProjectAsync(context.TargetDirectory, host)
+            .MapAsync(path => new ReleaseContext { TargetDirectory = context.TargetDirectory, ProjectFilePath = path })
+            .BindAsync(ProjectDiscoveryService.ExtractMetadata)
+            .BindAsync(ctx => PromptUserOptionsAsync(ctx, host))
+            .BindAsync(ProjectMutationService.UpdateProjectVersion)
+            .BindAsync(ctx => GitCommitService.CommitVersionBumpAsync(ctx, runner, host))
+            .BindAsync(ctx => GitSyncService.DetermineGitHubRemoteAsync(ctx, runner))
+            .BindAsync(ctx => GitSyncService.EnsureRemoteSyncAsync(ctx, runner, host))
+            .BindAsync(ctx => GitHubOrchestratorService.VerifyNewTagAsync(ctx, runner, host))
+            .BindAsync(async ctx =>
             {
-                TargetDirectory = context.TargetDirectory,
-                ProjectFilePath = projectPath
+                // Nested bind allows us to keep 'ctx' in scope while capturing the optional binary path
+                return await GitHubOrchestratorService.ExecuteOptionalBuildAsync(ctx, runner, host)
+                    .BindAsync(binaryPath => GitHubOrchestratorService.CreateGitHubReleaseAsync(ctx, binaryPath, runner, host)).ConfigureAwait(false);
             })
-            .BindAsync(ProjectDiscoveryService.ValidateAndExtractMetadata)
-            .BindAsync(ctx => GitOperationsService.DetermineGitHubRemoteAsync(ctx, runner, host))
-            .BindAsync(ctx => GitHubCliService.CheckExistingReleaseAsync(ctx, runner, host))
-            .BindAsync(ctx => PromptForVersionOverrideAsync(ctx, host))
-            .BindAsync(ctx => GitOperationsService.EnsureGitIntegrityAsync(ctx, runner, host))
-            .BindAsync(ctx => DotnetPublishService.ExecuteDotnetPublishAsync(ctx, runner, host))
-            .BindAsync(ctx => DotnetPublishService.LocatePublishedBinary(ctx, host)
-                // We use a nested BindAsync here so we can pass BOTH the context and the binaryPath into the final step
-                .BindAsync(binaryPath => GitHubCliService.CreateReleaseAsync(ctx, binaryPath, runner, host)))
-            .ConfigureAwait(false);
-
-        // Terminal UI Behavior Mapping
-        return pipelineResult.Match(
-            some: () => Maybe.Some(5), // Success: Countdown 5 seconds and auto-close
-            none: err => Maybe.PropagateFailure<int, Maybe>(pipelineResult) // Failure: Will trigger Core's 10-second error display
-        );
-    }
-
-    /// <summary>
-    /// Interactively asks the user if they want to override the version extracted from the project file.
-    /// </summary>
-    private static async Task<Maybe<ReleaseContext>> PromptForVersionOverrideAsync(ReleaseContext ctx, IHostServices host)
-    {
-        var inputResult = await host.PromptUserAsync($"\nCurrent version is {ctx.InitialVersion}. Enter new version or press Enter to keep:").ConfigureAwait(false);
-
-        return inputResult.Match(
-            some: input =>
+            .MatchAsync(
+            some: () =>
             {
-                // If they typed a value, use it as the FinalVersion
-                var finalVersion = string.IsNullOrWhiteSpace(input) ? ctx.InitialVersion : input.Trim();
-                return Maybe.Some(ctx with { FinalVersion = finalVersion });
+                host.Logger.LogInfo("\n[FINISH] GitHub Release process complete.");
+                return Maybe.Some<int>(5); // Success: Auto-close in 5s
             },
             none: err =>
             {
-                // Core's PromptUserAsync returns None if the user just presses Enter with empty input.
-                // In our case, that just means "keep the default".
-                return Maybe.Some(ctx);
-            }
+                host.Logger.LogError($"Release Failed: {err.Message}");
+                return Maybe.None<int>(err.Message); // Failure: Display error
+            })
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Handles the interactive configuration of the release.
+    /// </summary>
+    private static async Task<Maybe<ReleaseContext>> PromptUserOptionsAsync(ReleaseContext ctx, IHostServices host)
+    {
+        // 1. Version Override
+        var verResult = await host.PromptUserAsync($"Target Version [{ctx.InitialVersion}]:").ConfigureAwait(false);
+        var finalVersion = verResult.Match(
+            some: v => string.IsNullOrWhiteSpace(v) ? ctx.InitialVersion : v.Trim(),
+            none: _ => ctx.InitialVersion
         );
+
+        // 2. Local Build Opt-In
+        var buildResult = await host.PromptUserAsync("Build and upload local .exe? (y/N):").ConfigureAwait(false);
+        var attachLocal = buildResult.Match(
+            some: b => b.Equals("y", StringComparison.OrdinalIgnoreCase),
+            none: _ => false
+        );
+
+        return Maybe.Some(ctx with
+        {
+            FinalVersion = finalVersion,
+            AttachLocalBinary = attachLocal
+        });
     }
 }

@@ -3,7 +3,7 @@
 	<PropertyGroup>
 		<TargetFramework>net8.0</TargetFramework>
 		<LangVersion>12</LangVersion>
-		<Version>1.0.2</Version>
+		<Version>1.1.0</Version>
 		<RootNamespace>JinnDev.$(MSBuildProjectName.Replace(" ", "_"))</RootNamespace>
 		<AssemblyName>JinnDev.$(MSBuildProjectName.Replace(" ", "_"))</AssemblyName>
 		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -15,7 +15,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="JinnDev.JCMU.SDK" Version="1.1.2" />
+		<PackageReference Include="JinnDev.JCMU.SDK" Version="1.2.0" />
 		<PackageReference Include="JinnDev.Utilities.CommandLine" Version="8.0.4" />
 	</ItemGroup>
 
